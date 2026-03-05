@@ -200,6 +200,15 @@ class AudioUnpacker(_mp_ctx.Process):
 
         return self.strip_header_ext(box.decrypt(bytes(data), bytes(nonce)))
 
+    def _decrypt_aead_xchacha20_poly1305_rtpsize(self, header, data) -> bytes:
+        box = nacl.secret.Aead(bytes(self.secret_key))  # type: ignore
+
+        nonce = bytearray(24)
+        nonce[:4] = data[-4:]
+        data = data[:-4]
+
+        return self.strip_header_ext(box.decrypt(bytes(data), bytes(header), bytes(nonce)))
+
     @staticmethod
     def strip_header_ext(data: bytes) -> bytes:
         if data[0] == 0xBE and data[1] == 0xDE and len(data) > 4:
