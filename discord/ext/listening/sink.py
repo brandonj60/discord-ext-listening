@@ -477,8 +477,9 @@ class RawAudioData:
         self.csrc_list = struct.unpack_from(f">{csrc_count}I", buffer=data, offset=i)
         i += csrc_count * 4
 
-        # Extension parsing would go here, but discord's packets seem to have some problems
-        # related to that, so no attempt will be made to parse extensions.
+        if self.extended and len(data) >= i + 4:
+            _, extension_length = struct.unpack_from(">HH", buffer=data, offset=i)
+            i += 4 + extension_length * 4
 
         if padding and data[-1] != 0:
             data = data[: -data[-1]]
