@@ -479,6 +479,18 @@ class VoiceClient(BaseVoiceClient):
         await self._receiver.wait_for_standby()
         await self._receiver.wait_for_clean()
 
+    @staticmethod
+    def _resolve_socket(socket_like):
+        if hasattr(socket_like, "fileno") and hasattr(socket_like, "recv"):
+            return socket_like
+
+        for attr in ("socket", "sock", "_socket"):
+            inner = getattr(socket_like, attr, None)
+            if inner is not None and hasattr(inner, "fileno") and hasattr(inner, "recv"):
+                return inner
+
+        return None
+
     def recv_audio(self, *, dump: bool = False) -> Optional[bytes]:
         """Attempts to receive raw audio and returns it, otherwise nothing.
 
@@ -496,14 +508,19 @@ class VoiceClient(BaseVoiceClient):
         Optional[bytes]
             If audio was received then it's returned.
         """
-        ready, _, err = select.select([self.socket], [], [self.socket], 0.01)
+        socket_obj = self._resolve_socket(self.socket)
+        if socket_obj is None:
+            _log.error("Unable to resolve voice socket type for recv_audio: %r", type(self.socket))
+            return
+
+        ready, _, err = select.select([socket_obj], [], [socket_obj], 0.01)
         if err:
             _log.error(f"Socket error: {err[0]}")
             return
         if not ready or not self.is_connected():
             return
 
-        data = self.socket.recv(4096)
+        data = socket_obj.recv(4096)
         if dump:
             return
         return data
