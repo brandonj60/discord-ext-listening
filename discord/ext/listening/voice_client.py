@@ -231,6 +231,25 @@ class VoiceClient(BaseVoiceClient):
                 "speaking": speaking,
             }
 
+    def on_client_connect(self, data):
+        user_id = int(data["user_id"])
+        audio_ssrc = data.get("audio_ssrc")
+        if audio_ssrc is None:
+            return
+
+        user = self.guild.get_member(user_id)
+        self._ssrc_map[audio_ssrc] = {
+            "user": user if user is not None else Object(id=user_id, type=Member),
+            "speaking": self._ssrc_map.get(audio_ssrc, {}).get("speaking", 0),
+        }
+
+    def on_client_disconnect(self, data):
+        user_id = int(data["user_id"])
+        for ssrc, info in list(self._ssrc_map.items()):
+            user = info.get("user")
+            if user is not None and user.id == user_id:
+                self._ssrc_map.pop(ssrc, None)
+
     def get_member_from_ssrc(self, ssrc) -> Optional[Union[Member, Object]]:
         if ssrc in self._ssrc_map:
             user = self._ssrc_map[ssrc]["user"]

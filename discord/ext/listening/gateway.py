@@ -19,3 +19,7 @@ async def hook(self: DiscordVoiceWebSocket, msg: Dict[str, Any]):
 
     if op == DiscordVoiceWebSocket.SPEAKING:
         vc.update_ssrc(data)
+    elif op == DiscordVoiceWebSocket.CLIENT_CONNECT:
+        vc.on_client_connect(data)
+    elif op == DiscordVoiceWebSocket.CLIENT_DISCONNECT:
+        vc.on_client_disconnect(data)
