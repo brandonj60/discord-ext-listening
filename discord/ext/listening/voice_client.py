@@ -6,6 +6,11 @@ import threading
 from concurrent.futures import Future
 from typing import Any, Awaitable, Callable, Dict, Optional, Union
 
+try:
+    import davey  # type: ignore
+except ImportError:
+    davey = None
+
 from discord.errors import ClientException
 from discord.member import Member
 from discord.object import Object
@@ -15,7 +20,7 @@ from discord.gateway import DiscordVoiceWebSocket
 from . import opus
 from .enums import RTCPMessageType
 from .processing import AudioProcessPool
-from .sink import AudioFrame, AudioSink
+from .sink import SILENT_FRAME, AudioFrame, AudioSink
 
 __all__ = ("VoiceClient",)
 
@@ -61,6 +66,7 @@ class AudioReceiver(threading.Thread):
         self.loop = self.client.client.loop
 
         self.decode: bool = True
+        self.decoders: Dict[int, opus.Decoder] = {}
         self.after: Optional[Callable[..., Awaitable[Any]]] = None
         self.after_kwargs: Optional[dict] = None
 
@@ -84,7 +90,7 @@ class AudioReceiver(threading.Thread):
             future = self.process_pool.submit(  # type: ignore
                 data,
                 self.client.guild.id % self.process_pool.max_processes,  # type: ignore
-                self.decode,
+                self.decode and not self.client.should_decrypt_dave(),
                 self.client.mode,
                 self.client.secret_key,
             )
@@ -101,10 +107,49 @@ class AudioReceiver(threading.Thread):
         if isinstance(packet, AudioFrame):
             sink_callback = self.sink.on_audio
             packet.user = self.client.get_member_from_ssrc(packet.ssrc)
+
+            if self.client.should_decrypt_dave() and packet.audio:
+                packet = self._dave_decrypt_packet(packet)
+                if packet is None:
+                    return
+
+            if self.decode and packet.audio != SILENT_FRAME:
+                packet = self._decode_packet(packet)
+                if packet is None:
+                    return
         else:
             sink_callback = self.sink.on_rtcp
             packet.pt = RTCPMessageType(packet.pt)
         sink_callback(packet)  # type: ignore
+
+    def _dave_decrypt_packet(self, packet: AudioFrame) -> Optional[AudioFrame]:
+        if davey is None:
+            return packet
+
+        state = self.client._connection
+        dave_session = getattr(state, "dave_session", None)
+        if dave_session is None:
+            return packet
+
+        if packet.user is None:
+            return None
+
+        try:
+            packet.audio = dave_session.decrypt(packet.user.id, davey.MediaType.audio, packet.audio)
+            return packet
+        except Exception as exc:
+            _log.debug("Failed to decrypt DAVE packet for ssrc %s", packet.ssrc, exc_info=exc)
+            return None
+
+    def _decode_packet(self, packet: AudioFrame) -> Optional[AudioFrame]:
+        try:
+            if packet.ssrc not in self.decoders:
+                self.decoders[packet.ssrc] = opus.Decoder()
+            packet.audio = self.decoders[packet.ssrc].decode(packet.audio)
+            return packet
+        except Exception as exc:
+            _log.debug("Failed to decode opus packet for ssrc %s", packet.ssrc, exc_info=exc)
+            return None
 
     def run(self) -> None:
         try:
@@ -199,6 +244,10 @@ class VoiceClient(BaseVoiceClient):
 
         self._receiver = AudioReceiver(self)
         self._receiver.start()
+
+    def should_decrypt_dave(self) -> bool:
+        state = self._connection
+        return getattr(state, "dave_protocol_version", 0) > 0 and getattr(state, "dave_session", None) is not None
 
     async def disconnect(self, *, force=False):
         if not force and not self.is_connected():
