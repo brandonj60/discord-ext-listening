@@ -112,6 +112,11 @@ class AudioReceiver(threading.Thread):
         except BaseException as exc:
             _log.exception("Exception occurred in audio process", exc_info=exc)
             return
+
+        if packet is None:
+            _log.debug("Audio process returned empty packet (dropped during processing)")
+            return
+
         if self.sink is None:
             return
         if isinstance(packet, AudioFrame):

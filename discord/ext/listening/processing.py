@@ -1,4 +1,6 @@
+import logging
 import multiprocessing.context
+import nacl.exceptions
 import nacl.secret
 import queue
 import struct
@@ -18,6 +20,7 @@ __all__ = ("AudioProcessPool",)
 
 
 _mp_ctx: multiprocessing.context.SpawnContext = multiprocessing.get_context("spawn")
+_log = logging.getLogger(__name__)
 
 
 class AudioProcessPool:
@@ -162,7 +165,13 @@ class AudioUnpacker(_mp_ctx.Process):
                 if secret_key is not None:
                     self.secret_key = secret_key
 
-                packet = self.unpack_audio_packet(data, mode, decode)
+                try:
+                    packet = self.unpack_audio_packet(data, mode, decode)
+                except nacl.exceptions.CryptoError as exc:
+                    _log.debug("Dropping packet after transport decrypt failure: mode=%s size=%d", mode, len(data), exc_info=exc)
+                    pipe.send(None)
+                    continue
+
                 if isinstance(packet, RTCPPacket):
                     # enum not picklable
                     packet.pt = packet.pt.value  # type: ignore
@@ -205,9 +214,22 @@ class AudioUnpacker(_mp_ctx.Process):
 
         nonce = bytearray(24)
         nonce[:4] = data[-4:]
-        data = data[:-4]
+        ciphertext = data[:-4]
 
-        return self.strip_header_ext(box.decrypt(bytes(data), bytes(header), bytes(nonce)))
+        aad_candidates = (
+            bytes(header),
+            bytes(header[:12]),
+            b"",
+        )
+
+        last_exc = None
+        for aad in aad_candidates:
+            try:
+                return self.strip_header_ext(box.decrypt(bytes(ciphertext), aad, bytes(nonce)))
+            except nacl.exceptions.CryptoError as exc:
+                last_exc = exc
+
+        raise last_exc if last_exc is not None else nacl.exceptions.CryptoError("Decryption failed")
 
     @staticmethod
     def strip_header_ext(data: bytes) -> bytes:
