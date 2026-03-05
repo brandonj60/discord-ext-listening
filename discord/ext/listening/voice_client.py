@@ -3,6 +3,7 @@ import logging
 import queue
 import select
 import threading
+from time import monotonic
 from concurrent.futures import Future
 from typing import Any, Awaitable, Callable, Dict, Optional, Union
 
@@ -279,6 +280,7 @@ class VoiceClient(BaseVoiceClient):
 
         self._receiver: Optional[AudioReceiver] = None
         self._ssrc_map: Dict[int, Dict[str, Union[Member, Object]]] = {}
+        self._last_socket_missing_log: float = 0.0
 
     async def on_voice_server_update(self, data) -> None:
         await super().on_voice_server_update(data)
@@ -479,8 +481,7 @@ class VoiceClient(BaseVoiceClient):
         await self._receiver.wait_for_standby()
         await self._receiver.wait_for_clean()
 
-    @staticmethod
-    def _resolve_socket(socket_like):
+    def _resolve_socket(self, socket_like):
         if hasattr(socket_like, "fileno") and hasattr(socket_like, "recv"):
             return socket_like
 
@@ -510,8 +511,22 @@ class VoiceClient(BaseVoiceClient):
         """
         socket_obj = self._resolve_socket(self.socket)
         if socket_obj is None:
-            _log.error("Unable to resolve voice socket type for recv_audio: %r", type(self.socket))
+            connection_socket = getattr(getattr(self, "_connection", None), "socket", None)
+            socket_obj = self._resolve_socket(connection_socket)
+
+        if socket_obj is None:
+            now = monotonic()
+            if now - self._last_socket_missing_log >= 5:
+                self._last_socket_missing_log = now
+                _log.error(
+                    "Unable to resolve voice socket for recv_audio: VoiceClient.socket=%r VoiceConnectionState.socket=%r",
+                    type(getattr(self, "socket", None)),
+                    type(getattr(getattr(self, "_connection", None), "socket", None)),
+                )
             return
+
+        if self._last_socket_missing_log:
+            self._last_socket_missing_log = 0.0
 
         ready, _, err = select.select([socket_obj], [], [socket_obj], 0.01)
         if err:
