@@ -540,7 +540,11 @@ class VoiceClient(BaseVoiceClient):
         if not ready or not self.is_connected():
             return
 
-        data = socket_obj.recv(4096)
+        try:
+            data = socket_obj.recv(4096)
+        except BlockingIOError:
+            return
+
         if dump:
             return
         return data
