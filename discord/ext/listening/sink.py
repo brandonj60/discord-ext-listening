@@ -477,8 +477,9 @@ class RawAudioData:
         self.csrc_list = struct.unpack_from(f">{csrc_count}I", buffer=data, offset=i)
         i += csrc_count * 4
 
-        # Extension parsing would go here, but discord's packets seem to have some problems
-        # related to that, so no attempt will be made to parse extensions.
+        if self.extended and len(data) >= i + 4:
+            _, extension_length = struct.unpack_from(">HH", buffer=data, offset=i)
+            i += 4 + extension_length * 4
 
         if padding and data[-1] != 0:
             data = data[: -data[-1]]
@@ -527,6 +528,7 @@ _PACKET_TYPE = Union[
     RTCPSourceDescriptionPacket,
     RTCPGoodbyePacket,
     RTCPApplicationDefinedPacket,
+    RTCPPacket,
     RawAudioData,
 ]
 _RTCP_MAP = {
@@ -540,10 +542,13 @@ _RTCP_MAP = {
 
 def get_audio_packet(data: bytes, decrypt_method: Callable[[bytes, bytes], bytes]) -> _PACKET_TYPE:
     version_flag, payload_type, length = struct.unpack_from(">BBH", buffer=data)
-    if 200 <= payload_type <= 204:
-        rtcp_type = RTCPMessageType(payload_type)
-        return _RTCP_MAP[rtcp_type](version_flag, rtcp_type, length, data[4:])
+    if 192 <= payload_type <= 223:
+        if 200 <= payload_type <= 204:
+            rtcp_type = RTCPMessageType(payload_type)
+            return _RTCP_MAP[rtcp_type](version_flag, rtcp_type, length, data[4:])
+        return RTCPPacket(version_flag, payload_type, length)  # type: ignore[arg-type]
     return RawAudioData(data, decrypt_method)
+
 
 
 class AudioSink:

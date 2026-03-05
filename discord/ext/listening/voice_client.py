@@ -3,8 +3,14 @@ import logging
 import queue
 import select
 import threading
+from time import monotonic
 from concurrent.futures import Future
 from typing import Any, Awaitable, Callable, Dict, Optional, Union
+
+try:
+    import davey  # type: ignore
+except ImportError:
+    davey = None
 
 from discord.errors import ClientException
 from discord.member import Member
@@ -15,7 +21,7 @@ from discord.gateway import DiscordVoiceWebSocket
 from . import opus
 from .enums import RTCPMessageType
 from .processing import AudioProcessPool
-from .sink import AudioFrame, AudioSink
+from .sink import SILENT_FRAME, AudioFrame, AudioSink
 
 __all__ = ("VoiceClient",)
 
@@ -61,6 +67,7 @@ class AudioReceiver(threading.Thread):
         self.loop = self.client.client.loop
 
         self.decode: bool = True
+        self.decoders: Dict[int, opus.Decoder] = {}
         self.after: Optional[Callable[..., Awaitable[Any]]] = None
         self.after_kwargs: Optional[dict] = None
 
@@ -81,10 +88,19 @@ class AudioReceiver(threading.Thread):
             if data is None:
                 continue
 
+            dave_active = self.client.should_decrypt_dave()
+            _log.debug(
+                "Received raw UDP packet: size=%d mode=%s decode=%s dave_active=%s",
+                len(data),
+                self.client.mode,
+                self.decode,
+                dave_active,
+            )
+
             future = self.process_pool.submit(  # type: ignore
                 data,
                 self.client.guild.id % self.process_pool.max_processes,  # type: ignore
-                self.decode,
+                self.decode and not dave_active,
                 self.client.mode,
                 self.client.secret_key,
             )
@@ -96,15 +112,95 @@ class AudioReceiver(threading.Thread):
         except BaseException as exc:
             _log.exception("Exception occurred in audio process", exc_info=exc)
             return
+
+        if packet is None:
+            _log.debug("Audio process returned empty packet (dropped during processing)")
+            return
+
         if self.sink is None:
             return
         if isinstance(packet, AudioFrame):
             sink_callback = self.sink.on_audio
             packet.user = self.client.get_member_from_ssrc(packet.ssrc)
+            _log.debug(
+                "Processed RTP frame: ssrc=%s seq=%s ts=%s opus_len=%d user_resolved=%s",
+                packet.ssrc,
+                packet.sequence,
+                packet.timestamp,
+                len(packet.audio),
+                packet.user.id if packet.user is not None else None,
+            )
+
+            if self.client.should_decrypt_dave() and packet.audio:
+                packet = self._dave_decrypt_packet(packet)
+                if packet is None:
+                    _log.debug("Dropping RTP frame after DAVE decrypt attempt")
+                    return
+
+            if self.decode and packet.audio != SILENT_FRAME:
+                packet = self._decode_packet(packet)
+                if packet is None:
+                    _log.debug("Dropping RTP frame after Opus decode attempt")
+                    return
         else:
             sink_callback = self.sink.on_rtcp
-            packet.pt = RTCPMessageType(packet.pt)
+            try:
+                packet.pt = RTCPMessageType(packet.pt)
+            except ValueError:
+                _log.debug("Processed unknown RTCP packet type=%s", packet.pt)
+            else:
+                _log.debug("Processed RTCP packet: type=%s", packet.pt)
+
+        _log.debug("Delivering packet to sink callback: %s", sink_callback.__name__)
         sink_callback(packet)  # type: ignore
+
+    def _dave_decrypt_packet(self, packet: AudioFrame) -> Optional[AudioFrame]:
+        if davey is None:
+            _log.debug("DAVE decryption requested but davey is unavailable")
+            return packet
+
+        state = self.client._connection
+        dave_session = getattr(state, "dave_session", None)
+        if dave_session is None:
+            _log.debug("DAVE decryption requested but dave_session is unavailable")
+            return packet
+
+        if packet.user is None:
+            _log.debug("Cannot DAVE decrypt packet for ssrc=%s: unresolved user", packet.ssrc)
+            return None
+
+        try:
+            original_len = len(packet.audio)
+            packet.audio = dave_session.decrypt(packet.user.id, davey.MediaType.audio, packet.audio)
+            _log.debug(
+                "DAVE decrypt ok: ssrc=%s user_id=%s encrypted_len=%d decrypted_len=%d",
+                packet.ssrc,
+                packet.user.id,
+                original_len,
+                len(packet.audio),
+            )
+            return packet
+        except Exception as exc:
+            _log.debug("Failed to decrypt DAVE packet for ssrc %s", packet.ssrc, exc_info=exc)
+            return None
+
+    def _decode_packet(self, packet: AudioFrame) -> Optional[AudioFrame]:
+        try:
+            if packet.ssrc not in self.decoders:
+                _log.debug("Creating opus decoder for ssrc=%s", packet.ssrc)
+                self.decoders[packet.ssrc] = opus.Decoder()
+            encoded_len = len(packet.audio)
+            packet.audio = self.decoders[packet.ssrc].decode(packet.audio)
+            _log.debug(
+                "Opus decode ok: ssrc=%s encoded_len=%d pcm_len=%d",
+                packet.ssrc,
+                encoded_len,
+                len(packet.audio),
+            )
+            return packet
+        except Exception as exc:
+            _log.debug("Failed to decode opus packet for ssrc %s", packet.ssrc, exc_info=exc)
+            return None
 
     def run(self) -> None:
         try:
@@ -193,12 +289,25 @@ class VoiceClient(BaseVoiceClient):
 
         self._receiver: Optional[AudioReceiver] = None
         self._ssrc_map: Dict[int, Dict[str, Union[Member, Object]]] = {}
+        self._last_socket_missing_log: float = 0.0
 
     async def on_voice_server_update(self, data) -> None:
         await super().on_voice_server_update(data)
 
         self._receiver = AudioReceiver(self)
         self._receiver.start()
+
+    def should_decrypt_dave(self) -> bool:
+        state = self._connection
+        active = getattr(state, "dave_protocol_version", 0) > 0 and getattr(state, "dave_session", None) is not None
+        _log.debug(
+            "DAVE status: protocol_version=%s session_present=%s can_encrypt=%s active=%s",
+            getattr(state, "dave_protocol_version", None),
+            getattr(state, "dave_session", None) is not None,
+            getattr(state, "can_encrypt", None),
+            active,
+        )
+        return active
 
     async def disconnect(self, *, force=False):
         if not force and not self.is_connected():
@@ -230,6 +339,30 @@ class VoiceClient(BaseVoiceClient):
                 "user": user if user is not None else Object(id=user_id, type=Member),
                 "speaking": speaking,
             }
+
+    def on_client_connect(self, data):
+        user_id = int(data["user_id"])
+        audio_ssrc = data.get("audio_ssrc")
+        if audio_ssrc is None:
+            _log.debug("CLIENT_CONNECT missing audio_ssrc for user_id=%s", user_id)
+            return
+
+        user = self.guild.get_member(user_id)
+        self._ssrc_map[audio_ssrc] = {
+            "user": user if user is not None else Object(id=user_id, type=Member),
+            "speaking": self._ssrc_map.get(audio_ssrc, {}).get("speaking", 0),
+        }
+        _log.debug("Mapped audio_ssrc=%s to user_id=%s via CLIENT_CONNECT", audio_ssrc, user_id)
+
+    def on_client_disconnect(self, data):
+        user_id = int(data["user_id"])
+        removed = 0
+        for ssrc, info in list(self._ssrc_map.items()):
+            user = info.get("user")
+            if user is not None and user.id == user_id:
+                self._ssrc_map.pop(ssrc, None)
+                removed += 1
+        _log.debug("CLIENT_DISCONNECT user_id=%s removed_mappings=%d", user_id, removed)
 
     def get_member_from_ssrc(self, ssrc) -> Optional[Union[Member, Object]]:
         if ssrc in self._ssrc_map:
@@ -357,6 +490,17 @@ class VoiceClient(BaseVoiceClient):
         await self._receiver.wait_for_standby()
         await self._receiver.wait_for_clean()
 
+    def _resolve_socket(self, socket_like):
+        if hasattr(socket_like, "fileno") and hasattr(socket_like, "recv"):
+            return socket_like
+
+        for attr in ("socket", "sock", "_socket"):
+            inner = getattr(socket_like, attr, None)
+            if inner is not None and hasattr(inner, "fileno") and hasattr(inner, "recv"):
+                return inner
+
+        return None
+
     def recv_audio(self, *, dump: bool = False) -> Optional[bytes]:
         """Attempts to receive raw audio and returns it, otherwise nothing.
 
@@ -374,14 +518,37 @@ class VoiceClient(BaseVoiceClient):
         Optional[bytes]
             If audio was received then it's returned.
         """
-        ready, _, err = select.select([self.socket], [], [self.socket], 0.01)
+        socket_obj = self._resolve_socket(self.socket)
+        if socket_obj is None:
+            connection_socket = getattr(getattr(self, "_connection", None), "socket", None)
+            socket_obj = self._resolve_socket(connection_socket)
+
+        if socket_obj is None:
+            now = monotonic()
+            if now - self._last_socket_missing_log >= 5:
+                self._last_socket_missing_log = now
+                _log.error(
+                    "Unable to resolve voice socket for recv_audio: VoiceClient.socket=%r VoiceConnectionState.socket=%r",
+                    type(getattr(self, "socket", None)),
+                    type(getattr(getattr(self, "_connection", None), "socket", None)),
+                )
+            return
+
+        if self._last_socket_missing_log:
+            self._last_socket_missing_log = 0.0
+
+        ready, _, err = select.select([socket_obj], [], [socket_obj], 0.01)
         if err:
             _log.error(f"Socket error: {err[0]}")
             return
         if not ready or not self.is_connected():
             return
 
-        data = self.socket.recv(4096)
+        try:
+            data = socket_obj.recv(4096)
+        except BlockingIOError:
+            return
+
         if dump:
             return
         return data
