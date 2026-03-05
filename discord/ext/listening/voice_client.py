@@ -144,8 +144,12 @@ class AudioReceiver(threading.Thread):
                     return
         else:
             sink_callback = self.sink.on_rtcp
-            packet.pt = RTCPMessageType(packet.pt)
-            _log.debug("Processed RTCP packet: type=%s", packet.pt)
+            try:
+                packet.pt = RTCPMessageType(packet.pt)
+            except ValueError:
+                _log.debug("Processed unknown RTCP packet type=%s", packet.pt)
+            else:
+                _log.debug("Processed RTCP packet: type=%s", packet.pt)
 
         _log.debug("Delivering packet to sink callback: %s", sink_callback.__name__)
         sink_callback(packet)  # type: ignore

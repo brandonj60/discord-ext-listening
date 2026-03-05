@@ -528,6 +528,7 @@ _PACKET_TYPE = Union[
     RTCPSourceDescriptionPacket,
     RTCPGoodbyePacket,
     RTCPApplicationDefinedPacket,
+    RTCPPacket,
     RawAudioData,
 ]
 _RTCP_MAP = {
@@ -541,10 +542,13 @@ _RTCP_MAP = {
 
 def get_audio_packet(data: bytes, decrypt_method: Callable[[bytes, bytes], bytes]) -> _PACKET_TYPE:
     version_flag, payload_type, length = struct.unpack_from(">BBH", buffer=data)
-    if 200 <= payload_type <= 204:
-        rtcp_type = RTCPMessageType(payload_type)
-        return _RTCP_MAP[rtcp_type](version_flag, rtcp_type, length, data[4:])
+    if 192 <= payload_type <= 223:
+        if 200 <= payload_type <= 204:
+            rtcp_type = RTCPMessageType(payload_type)
+            return _RTCP_MAP[rtcp_type](version_flag, rtcp_type, length, data[4:])
+        return RTCPPacket(version_flag, payload_type, length)  # type: ignore[arg-type]
     return RawAudioData(data, decrypt_method)
+
 
 
 class AudioSink:
